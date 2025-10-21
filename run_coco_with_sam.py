@@ -30,6 +30,8 @@ Example:
 import argparse
 import json
 import os
+import time
+import csv
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -43,6 +45,19 @@ import torch
 # SAM imports (after pip install -e . at repo root)
 from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
 
+def _p(p: str) -> Path:
+    """Expand ~ and env vars, return Path (do not require existing)."""
+    if p is None:
+        return None
+    return Path(os.path.expandvars(os.path.expanduser(p)))
+
+def _sync_if_cuda(device: str):
+    """If running on CUDA, synchronize to get accurate timings."""
+    if device and str(device).startswith("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
 def colorize_mask(mask: np.ndarray) -> np.ndarray:
     """Return RGB color for a binary mask (random but deterministic per call)."""
@@ -171,28 +186,50 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
-    coco_root = Path(args.coco_root)
+    # Timing holders
+    per_image_timings = []  # list of dicts: {image_id, file_name, seconds}
+    t0_total = time.perf_counter()
+
+    # NEW: robust path expansion (~, %ENV%, $ENV)
+    coco_root = _p(args.coco_root)
+    ann_file  = _p(args.ann_file)
+    ckpt_path = _p(args.checkpoint)
+    out_dir   = _p(args.out_dir)
+
+    # Optional: allow COCO_ROOT env var as fallback if user passed "."
+    if str(coco_root) in (".", ""):
+        env_root = os.environ.get("COCO_ROOT")
+        if env_root:
+            coco_root = _p(env_root)
+
+    # Validate ann & checkpoint exist
+    if not ann_file.exists():
+        raise FileNotFoundError(f"COCO annotations not found: {ann_file}")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"SAM checkpoint not found: {ckpt_path}")
+
     split_dir = coco_root / "images" / args.split
     if not split_dir.exists():
-        # Some setups put images directly under /val2017 instead of /images/val2017
         alt = coco_root / args.split
         if alt.exists():
             split_dir = alt
         else:
             raise FileNotFoundError(f"Cannot find images dir: {split_dir} or {alt}")
 
-    out_base = Path(args.out_dir) / args.split
+    out_base = out_dir / args.split
     vis_dir = out_base / "vis"
     json_dir = out_base / "json"
     vis_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
 
     # Load COCO
-    coco = COCO(args.ann_file)
+    coco = COCO(str(ann_file))
+    
+    # Get image ID
     img_ids = coco.getImgIds()
     if args.max_images and args.max_images > 0:
         img_ids = img_ids[: args.max_images]
-
+    
     # Build SAM
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
     sam.to(device=args.device)
@@ -220,6 +257,9 @@ def main():
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+        # --- start timing (include segmentation + rle/json + visualization + disk IO) ---
+        t_start = time.perf_counter()
+
         if args.mode == "auto":
             masks = sam_auto_generate(sam, img_rgb, amg_kwargs)
         else:
@@ -229,7 +269,7 @@ def main():
             bboxes_xywh = [a["bbox"] for a in anns if "bbox" in a and a.get("iscrowd", 0) == 0]
             masks = sam_from_bboxes(predictor, img_rgb, bboxes_xywh)
 
-        # Dump JSONL and visualization
+        # Dump JSONL
         jsonl_path = json_dir / f"{img_id}.jsonl"
         with open(jsonl_path, "w", encoding="utf-8") as f:
             for m in masks:
@@ -249,9 +289,38 @@ def main():
         vis_path = vis_dir / f"{img_id}.png"
         cv2.imwrite(str(vis_path), vis)
 
-        if (idx + 1) % 20 == 0:
-            print(f"[{idx + 1}/{len(img_ids)}] saved -> {vis_path.name}, {jsonl_path.name}")
+        # --- end timing (sync CUDA to avoid under-reporting) ---
+        _sync_if_cuda(args.device)
+        elapsed = time.perf_counter() - t_start
 
+        # record + log
+        per_image_timings.append({"image_id": int(img_id), "file_name": file_name, "seconds": elapsed})
+        if (idx + 1) % 20 == 0:
+            avg20 = float(np.mean([x["seconds"] for x in per_image_timings[-20:]]))
+            print(f"[{idx + 1}/{len(img_ids)}] {file_name} took {elapsed:.3f}s | last-20 avg {avg20:.3f}s")
+        else:
+            print(f"[{idx + 1}/{len(img_ids)}] {file_name} took {elapsed:.3f}s")
+
+    # --- summary + CSV ---
+    _sync_if_cuda(args.device)
+    total_sec = time.perf_counter() - t0_total
+    avg_sec = float(np.mean([x["seconds"] for x in per_image_timings])) if per_image_timings else 0.0
+
+    csv_path = out_base / "timings.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as fcsv:
+        writer = csv.DictWriter(
+            fcsv,
+            fieldnames=["image_id", "file_name", "seconds", "mode", "model_type", "device"]
+        )
+        writer.writeheader()
+        for row in per_image_timings:
+            row_out = dict(row)
+            row_out.update({"mode": args.mode, "model_type": args.model_type, "device": args.device})
+            writer.writerow(row_out)
+
+    print(f"Per-image timings saved to: {csv_path}")
+    print(f"Total images processed: {len(per_image_timings)}")
+    print(f"Total time: {total_sec:.3f}s | Average per image: {avg_sec:.3f}s")
     print("Done.")
 
 
